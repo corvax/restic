@@ -416,6 +416,8 @@ func OpenRepository(opts GlobalOptions) (*repository.Repository, error) {
 		if err != nil && passwordTriesLeft > 1 {
 			opts.password = ""
 			fmt.Printf("%s. Try again\n", err)
+		} else {
+			break
 		}
 	}
 	if err != nil {

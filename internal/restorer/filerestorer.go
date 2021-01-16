@@ -1,11 +1,12 @@
 package restorer
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"io"
 	"math"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	"github.com/restic/restic/internal/crypto"
@@ -33,6 +34,7 @@ const (
 type fileInfo struct {
 	lock     sync.Mutex
 	flags    int
+	size     int64
 	location string      // file on local filesystem relative to restorer basedir
 	blobs    interface{} // blobs of the file
 }
@@ -51,7 +53,7 @@ type packInfo struct {
 // fileRestorer restores set of files
 type fileRestorer struct {
 	key        *crypto.Key
-	idx        func(restic.ID, restic.BlobType) []restic.PackedBlob
+	idx        func(restic.BlobHandle) []restic.PackedBlob
 	packLoader func(ctx context.Context, h restic.Handle, length int, offset int64, fn func(rd io.Reader) error) error
 
 	filesWriter *filesWriter
@@ -63,7 +65,7 @@ type fileRestorer struct {
 func newFileRestorer(dst string,
 	packLoader func(ctx context.Context, h restic.Handle, length int, offset int64, fn func(rd io.Reader) error) error,
 	key *crypto.Key,
-	idx func(restic.ID, restic.BlobType) []restic.PackedBlob) *fileRestorer {
+	idx func(restic.BlobHandle) []restic.PackedBlob) *fileRestorer {
 
 	return &fileRestorer{
 		key:         key,
@@ -74,8 +76,8 @@ func newFileRestorer(dst string,
 	}
 }
 
-func (r *fileRestorer) addFile(location string, content restic.IDs) {
-	r.files = append(r.files, &fileInfo{location: location, blobs: content})
+func (r *fileRestorer) addFile(location string, content restic.IDs, size int64) {
+	r.files = append(r.files, &fileInfo{location: location, blobs: content, size: size})
 }
 
 func (r *fileRestorer) targetPath(location string) string {
@@ -88,7 +90,7 @@ func (r *fileRestorer) forEachBlob(blobIDs []restic.ID, fn func(packID restic.ID
 	}
 
 	for _, blobID := range blobIDs {
-		packs := r.idx(blobID, restic.DataBlob)
+		packs := r.idx(restic.BlobHandle{ID: blobID, Type: restic.DataBlob})
 		if len(packs) == 0 {
 			return errors.Errorf("Unknown blob %s", blobID.String())
 		}
@@ -101,6 +103,10 @@ func (r *fileRestorer) forEachBlob(blobIDs []restic.ID, fn func(packID restic.ID
 func (r *fileRestorer) restoreFiles(ctx context.Context) error {
 
 	packs := make(map[restic.ID]*packInfo) // all packs
+	// Process packs in order of first access. While this cannot guarantee
+	// that file chunks are restored sequentially, it offers a good enough
+	// approximation to shorten restore times by up to 19% in some test.
+	var packOrder restic.IDs
 
 	// create packInfo from fileInfo
 	for _, file := range r.files {
@@ -123,6 +129,7 @@ func (r *fileRestorer) restoreFiles(ctx context.Context) error {
 					files: make(map[*fileInfo]struct{}),
 				}
 				packs[packID] = pack
+				packOrder = append(packOrder, packID)
 			}
 			pack.files[file] = struct{}{}
 		})
@@ -157,7 +164,8 @@ func (r *fileRestorer) restoreFiles(ctx context.Context) error {
 	}
 
 	// the main restore loop
-	for _, pack := range packs {
+	for _, id := range packOrder {
+		pack := packs[id]
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -171,6 +179,8 @@ func (r *fileRestorer) restoreFiles(ctx context.Context) error {
 
 	return nil
 }
+
+const maxBufferSize = 4 * 1024 * 1024
 
 func (r *fileRestorer) downloadPack(ctx context.Context, pack *packInfo) {
 
@@ -208,7 +218,7 @@ func (r *fileRestorer) downloadPack(ctx context.Context, pack *packInfo) {
 			})
 		} else if packsMap, ok := file.blobs.(map[restic.ID][]fileBlobInfo); ok {
 			for _, blob := range packsMap[pack.id] {
-				idxPacks := r.idx(blob.id, restic.DataBlob)
+				idxPacks := r.idx(restic.BlobHandle{ID: blob.id, Type: restic.DataBlob})
 				for _, idxPack := range idxPacks {
 					if idxPack.PackID.Equal(pack.id) {
 						addBlob(idxPack.Blob, blob.offset)
@@ -219,18 +229,12 @@ func (r *fileRestorer) downloadPack(ctx context.Context, pack *packInfo) {
 		}
 	}
 
-	packData := make([]byte, int(end-start))
-
-	h := restic.Handle{Type: restic.DataFile, Name: pack.id.String()}
-	err := r.packLoader(ctx, h, int(end-start), start, func(rd io.Reader) error {
-		l, err := io.ReadFull(rd, packData)
-		if err != nil {
-			return err
-		}
-		if l != len(packData) {
-			return errors.Errorf("unexpected pack size: expected %d but got %d", len(packData), l)
-		}
-		return nil
+	sortedBlobs := make([]restic.ID, 0, len(blobs))
+	for blobID := range blobs {
+		sortedBlobs = append(sortedBlobs, blobID)
+	}
+	sort.Slice(sortedBlobs, func(i, j int) bool {
+		return blobs[sortedBlobs[i]].offset < blobs[sortedBlobs[j]].offset
 	})
 
 	markFileError := func(file *fileInfo, err error) {
@@ -241,6 +245,62 @@ func (r *fileRestorer) downloadPack(ctx context.Context, pack *packInfo) {
 		}
 	}
 
+	h := restic.Handle{Type: restic.PackFile, Name: pack.id.String()}
+	err := r.packLoader(ctx, h, int(end-start), start, func(rd io.Reader) error {
+		bufferSize := int(end - start)
+		if bufferSize > maxBufferSize {
+			bufferSize = maxBufferSize
+		}
+		bufRd := bufio.NewReaderSize(rd, bufferSize)
+		currentBlobEnd := start
+		var blobData, buf []byte
+		for _, blobID := range sortedBlobs {
+			blob := blobs[blobID]
+			_, err := bufRd.Discard(int(blob.offset - currentBlobEnd))
+			if err != nil {
+				return err
+			}
+			blobData, buf, err = r.loadBlob(bufRd, blobID, blob.length, buf)
+			if err != nil {
+				for file := range blob.files {
+					markFileError(file, err)
+				}
+				continue
+			}
+			currentBlobEnd = blob.offset + int64(blob.length)
+			for file, offsets := range blob.files {
+				for _, offset := range offsets {
+					writeToFile := func() error {
+						// this looks overly complicated and needs explanation
+						// two competing requirements:
+						// - must create the file once and only once
+						// - should allow concurrent writes to the file
+						// so write the first blob while holding file lock
+						// write other blobs after releasing the lock
+						file.lock.Lock()
+						create := file.flags&fileProgress == 0
+						createSize := int64(-1)
+						if create {
+							defer file.lock.Unlock()
+							file.flags |= fileProgress
+							createSize = file.size
+						} else {
+							file.lock.Unlock()
+						}
+						return r.filesWriter.writeToFile(r.targetPath(file.location), blobData, offset, createSize)
+					}
+					err := writeToFile()
+					if err != nil {
+						markFileError(file, err)
+						break
+					}
+				}
+			}
+		}
+
+		return nil
+	})
+
 	if err != nil {
 		for file := range pack.files {
 			markFileError(file, err)
@@ -248,70 +308,37 @@ func (r *fileRestorer) downloadPack(ctx context.Context, pack *packInfo) {
 		return
 	}
 
-	rd := bytes.NewReader(packData)
-
-	for blobID, blob := range blobs {
-		blobData, err := r.loadBlob(rd, blobID, blob.offset-start, blob.length)
-		if err != nil {
-			for file := range blob.files {
-				markFileError(file, err)
-			}
-			continue
-		}
-		for file, offsets := range blob.files {
-			for _, offset := range offsets {
-				writeToFile := func() error {
-					// this looks overly complicated and needs explanation
-					// two competing requirements:
-					// - must create the file once and only once
-					// - should allow concurrent writes to the file
-					// so write the first blob while holding file lock
-					// write other blobs after releasing the lock
-					file.lock.Lock()
-					create := file.flags&fileProgress == 0
-					if create {
-						defer file.lock.Unlock()
-						file.flags |= fileProgress
-					} else {
-						file.lock.Unlock()
-					}
-					return r.filesWriter.writeToFile(r.targetPath(file.location), blobData, offset, create)
-				}
-				err := writeToFile()
-				if err != nil {
-					markFileError(file, err)
-					break
-				}
-			}
-		}
-	}
 }
 
-func (r *fileRestorer) loadBlob(rd io.ReaderAt, blobID restic.ID, offset int64, length int) ([]byte, error) {
+func (r *fileRestorer) loadBlob(rd io.Reader, blobID restic.ID, length int, buf []byte) ([]byte, []byte, error) {
 	// TODO reconcile with Repository#loadBlob implementation
 
-	buf := make([]byte, length)
+	if cap(buf) < length {
+		buf = make([]byte, length)
+	} else {
+		buf = buf[:length]
+	}
 
-	n, err := rd.ReadAt(buf, offset)
+	n, err := io.ReadFull(rd, buf)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if n != length {
-		return nil, errors.Errorf("error loading blob %v: wrong length returned, want %d, got %d", blobID.Str(), length, n)
+		return nil, nil, errors.Errorf("error loading blob %v: wrong length returned, want %d, got %d", blobID.Str(), length, n)
 	}
 
 	// decrypt
 	nonce, ciphertext := buf[:r.key.NonceSize()], buf[r.key.NonceSize():]
 	plaintext, err := r.key.Open(ciphertext[:0], nonce, ciphertext, nil)
 	if err != nil {
-		return nil, errors.Errorf("decrypting blob %v failed: %v", blobID, err)
+		return nil, nil, errors.Errorf("decrypting blob %v failed: %v", blobID, err)
 	}
 
 	// check hash
 	if !restic.Hash(plaintext).Equal(blobID) {
-		return nil, errors.Errorf("blob %v returned invalid hash", blobID)
+		return nil, nil, errors.Errorf("blob %v returned invalid hash", blobID)
 	}
 
-	return plaintext, nil
+	return plaintext, buf, nil
 }

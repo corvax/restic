@@ -16,7 +16,8 @@ help also.
 
 The restic project uses the GitHub infrastructure (see the
 [project page](https://github.com/restic/restic)) for all related discussions
-as well as the `#restic` channel on `irc.freenode.net`.
+as well as the [forum](https://forum.restic.net/) and the `#restic` channel
+on [irc.freenode.net](https://kiwiirc.com/nextclient/irc.freenode.net/restic).
 
 If you want to find an area that currently needs improving have a look at the
 open issues listed at the
@@ -25,7 +26,10 @@ for discussing enhancement to the restic tools.
 
 If you are unsure what to do, please have a look at the issues, especially
 those tagged
-[minor complexity](https://github.com/restic/restic/labels/minor%20complexity).
+[minor complexity](https://github.com/restic/restic/labels/help%3A%20minor%20complexity)
+or [good first issue](https://github.com/restic/restic/labels/help%3A%20good%20first%20issue).
+If you are already a bit experienced with the restic internals, take a look
+at the issues tagged as [help wanted](https://github.com/restic/restic/labels/help%3A%20wanted).
 
 
 Reporting Bugs
@@ -63,7 +67,7 @@ Development Environment
 The repository contains the code written for restic in the directories
 `cmd/` and `internal/`.
 
-Restic requires Go version 1.12 or later for compiling. Clone the repo (without
+Restic requires Go version 1.13 or later for compiling. Clone the repo (without
 having `$GOPATH` set) and `cd` into the directory:
 
     $ unset GOPATH
@@ -74,7 +78,7 @@ Then use the `go` tool to build restic:
 
     $ go build ./cmd/restic
     $ ./restic version
-    restic 0.9.6-dev (compiled manually) compiled with go1.14 on linux/amd64
+    restic 0.10.0-dev (compiled manually) compiled with go1.15.2 on linux/amd64
 
 You can run all tests with the following command:
 

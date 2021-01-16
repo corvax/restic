@@ -224,7 +224,7 @@ func BenchmarkLoadAndDecrypt(b *testing.B) {
 
 	dataID := restic.Hash(buf)
 
-	storageID, err := repo.SaveUnpacked(context.TODO(), restic.DataFile, buf)
+	storageID, err := repo.SaveUnpacked(context.TODO(), restic.PackFile, buf)
 	rtest.OK(b, err)
 	// rtest.OK(b, repo.Flush())
 
@@ -232,7 +232,7 @@ func BenchmarkLoadAndDecrypt(b *testing.B) {
 	b.SetBytes(int64(length))
 
 	for i := 0; i < b.N; i++ {
-		data, err := repo.LoadAndDecrypt(context.TODO(), nil, restic.DataFile, storageID)
+		data, err := repo.LoadAndDecrypt(context.TODO(), nil, restic.PackFile, storageID)
 		rtest.OK(b, err)
 
 		// See comment in BenchmarkLoadBlob.
@@ -273,6 +273,14 @@ func TestLoadJSONUnpacked(t *testing.T) {
 
 	rtest.Equals(t, sn.Hostname, sn2.Hostname)
 	rtest.Equals(t, sn.Username, sn2.Username)
+
+	var cf restic.Config
+
+	// load and check Config
+	err = repo.LoadJSONUnpacked(context.TODO(), restic.ConfigFile, id, &cf)
+	rtest.OK(t, err)
+
+	rtest.Equals(t, cf.ChunkerPolynomial, repository.TestChunkerPol)
 }
 
 var repoFixture = filepath.Join("testdata", "test-repo.tar.gz")
@@ -296,10 +304,9 @@ func BenchmarkLoadIndex(b *testing.B) {
 	for i := 0; i < 5000; i++ {
 		idx.Store(restic.PackedBlob{
 			Blob: restic.Blob{
-				Type:   restic.DataBlob,
-				Length: 1234,
-				ID:     restic.NewRandomID(),
-				Offset: 1235,
+				BlobHandle: restic.NewRandomBlobHandle(),
+				Length:     1234,
+				Offset:     1235,
 			},
 			PackID: restic.NewRandomID(),
 		})

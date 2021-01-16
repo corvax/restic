@@ -9,7 +9,7 @@ import (
 )
 
 var cmdList = &cobra.Command{
-	Use:   "list [blobs|packs|index|snapshots|keys|locks]",
+	Use:   "list [flags] [blobs|packs|index|snapshots|keys|locks]",
 	Short: "List objects in the repository",
 	Long: `
 The "list" command allows listing objects in the repository based on type.
@@ -40,7 +40,7 @@ func runList(cmd *cobra.Command, opts GlobalOptions, args []string) error {
 	}
 
 	if !opts.NoLock {
-		lock, err := lockRepo(repo)
+		lock, err := lockRepo(opts.ctx, repo)
 		defer unlockRepo(lock)
 		if err != nil {
 			return err
@@ -50,7 +50,7 @@ func runList(cmd *cobra.Command, opts GlobalOptions, args []string) error {
 	var t restic.FileType
 	switch args[0] {
 	case "packs":
-		t = restic.DataFile
+		t = restic.PackFile
 	case "index":
 		t = restic.IndexFile
 	case "snapshots":

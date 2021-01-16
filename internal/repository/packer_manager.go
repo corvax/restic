@@ -57,7 +57,10 @@ func (r *packerManager) findPacker() (packer *Packer, err error) {
 	// search for a suitable packer
 	if len(r.packers) > 0 {
 		p := r.packers[0]
-		r.packers = r.packers[1:]
+		last := len(r.packers) - 1
+		r.packers[0] = r.packers[last]
+		r.packers[last] = nil // Allow GC of stale reference.
+		r.packers = r.packers[:last]
 		return p, nil
 	}
 
@@ -97,7 +100,7 @@ func (r *Repository) savePacker(ctx context.Context, t restic.BlobType, p *Packe
 	}
 
 	id := restic.IDFromHash(p.hw.Sum(nil))
-	h := restic.Handle{Type: restic.DataFile, Name: id.String()}
+	h := restic.Handle{Type: restic.PackFile, Name: id.String()}
 
 	rd, err := restic.NewFileReader(p.tmpfile)
 	if err != nil {
